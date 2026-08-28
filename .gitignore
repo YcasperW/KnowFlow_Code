@@ -1,0 +1,37 @@
+# ===== 密钥（绝不能上传 GitHub） =====
+.env
+.env.*
+!.env.example
+
+# ===== 数据与生成物（可重新生成、体积大、含私人文档） =====
+data/
+output/
+Web/
+
+# ===== Python 缓存 / 虚拟环境 =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+
+# ===== 模型与向量产物 =====
+*.pkl
+*.npy
+*.npz
+*.model
+
+# ===== 系统 / 临时文件 =====
+.DS_Store
+~$*
+Thumbs.db
+
+# ===== 编辑器 / 虚拟环境 / 残留 =====
+.idea/
+.vscode/
+nul
+Archive/
+IPYNB/
