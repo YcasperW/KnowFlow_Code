@@ -1,7 +1,9 @@
+import os
 import importlib.util
 
-spec = importlib.util.spec_from_file_location(
-    "wf", r"D:\杂\个人文件\Openworkspace\RAG MVP\RAG MVP\Web Frame.py")
+# 修复：原为硬编码绝对路径，仓库换个位置就跑不起来。改为相对本文件定位。
+_PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Web Frame.py")
+spec = importlib.util.spec_from_file_location("wf", _PAGE_PATH)
 wf = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(wf)
 app = wf.app

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import html
 import time as _time
 import hashlib
 import secrets
@@ -8,11 +9,16 @@ from flask import Flask, request, jsonify, Response, session
 from dotenv import load_dotenv
 from RAG_pipeline import TextEmbedder
 from document_manager import DocumentManager
+from document_processor import DocumentProcessor
 
 import logging
 
 from clustered_retriever import ClusteredRetriever
 from RAG_pipeline import RAGPipeline
+# 注意：提示词 / 标准文档会被管理员在线修改（save_prompts 会重新绑定模块级变量），
+# 因此这里导入的是「取值函数」而不是字典对象本身，避免持有过期的旧引用。
+from structured_cite import (get_task_prompt, get_task_prompts, get_standard_doc,
+                            get_standard_docs, save_prompts, save_standard_docs)
 
 # ===== 路径配置 =====
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -117,6 +123,24 @@ import threading as _thr
 _FEEDBACK_LOCK = _thr.Lock()
 FEEDBACK_STORE = []  # 内存暂存，同时落盘 output/feedback.jsonl
 
+# ===== 会话级任务记忆：让「猜你想问」选中的任务型系统指令在整轮对话中持续生效 =====
+SESSION_TASKS = {}       # {session_id: task_key}
+_SESSION_TASKS_MAX = 500  # 上限：会话 ID 由前端随机生成，不设限会随访问量无限增长
+
+def _remember_task(session_id, task):
+    """记录/读取会话的任务键，并做容量裁剪（简易 FIFO）。
+
+    前端每次点「新对话」都会生成一个新 session_id，原实现只增不减，
+    长时间运行会持续吃内存；超过上限时丢弃最早写入的一批。
+    """
+    if task:
+        SESSION_TASKS[session_id] = task
+        if len(SESSION_TASKS) > _SESSION_TASKS_MAX:
+            for k in list(SESSION_TASKS.keys())[:_SESSION_TASKS_MAX // 10]:
+                SESSION_TASKS.pop(k, None)
+        return task
+    return SESSION_TASKS.get(session_id)
+
 def _save_feedback(entry):
     FEEDBACK_STORE.append(entry)
     try:
@@ -138,7 +162,8 @@ print(f"📁 embeddings exists: {os.path.exists(embeddings_path)}")
 embedder = TextEmbedder("paraphrase-multilingual-MiniLM-L12-v2")
 
 # ===== 初始化 retriever =====
-# alpha=0.4：混合检索中 BM25 占 40%、dense 占 60%。
+# alpha=0.4：融合公式为 alpha*dense + (1-alpha)*bm25，即 dense 占 40%、BM25 占 60%。
+# （原注释把两者写反了，与 clustered_retriever.py 的 fused 计算不符）
 # 对"人名/工号/编号"等专有名词场景，BM25 权重需足够大才能纠正纯向量的误召回。
 retriever = ClusteredRetriever(embedder=embedder, n_clusters=20, routing_top_k=3, alpha=0.4)
 
@@ -269,6 +294,32 @@ _PAGE = r'''<!DOCTYPE html>
     cursor: pointer;
     font-size: 12px;
   }
+  .std-panel {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px dashed #d0d6e8;
+  }
+  .std-title { font-size: 14px; font-weight: 600; color: #334; margin-bottom: 8px; }
+  .std-title small { font-weight: 400; color: #8a9099; font-size: 12px; }
+  .std-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 6px 0;
+    border-bottom: 1px solid #eef0f5;
+  }
+  .std-item .std-label { width: 120px; font-size: 13px; color: #445; }
+  .std-item input[type="file"] { flex: 1 1 140px; font-size: 12px; }
+  .std-item .std-btn {
+    border: none; background: #4f7cff; color: #fff; padding: 4px 12px;
+    border-radius: 6px; cursor: pointer; font-size: 12px;
+  }
+  .std-item .std-del {
+    border: none; background: none; color: #e54d42; cursor: pointer; font-size: 12px;
+  }
+  .std-item .std-status { font-size: 12px; color: #4f7cff; }
+  .std-item .std-meta { font-size: 12px; color: #999; width: 100%; }
   .messages {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -306,6 +357,17 @@ _PAGE = r'''<!DOCTYPE html>
     color: #8a9099;
     line-height: 1.5;
   }
+  .bubble .confidence {
+    margin-top: 8px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    display: inline-block;
+  }
+  .bubble .confidence.high { background: #e6f7ed; color: #1a8a4f; }
+  .bubble .confidence.mid  { background: #fff4e0; color: #b9770b; }
+  .bubble .confidence.low  { background: #fdecec; color: #c0392b; }
   .bubble .token {
     margin-top: 6px;
     font-size: 12px;
@@ -368,6 +430,28 @@ _PAGE = r'''<!DOCTYPE html>
     font-size: 14px;
   }
   .inputbar button:disabled { background: #b9c6ff; cursor: not-allowed; }
+  .suggest {
+    flex: 0 0 auto;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: #f7f8fa;
+    border-top: 1px solid #eceef1;
+  }
+  .suggest-label { font-size: 13px; color: #8a9099; }
+  .suggest .chip {
+    border: 1px solid #c9d6ff;
+    background: #eef1ff;
+    color: #3a4fb5;
+    padding: 5px 12px;
+    border-radius: 16px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .suggest .chip:hover { background: #dfe5ff; border-color: #4f7cff; }
   .stream-toggle { color:#7c89c4; font-size:13px; display:flex; align-items:center; gap:4px; user-select:none; }
   .feedback { margin-top:8px; }
   .feedback button { background:#eef1ff; border:1px solid #c7d0ff; border-radius:8px; cursor:pointer; padding:2px 10px; font-size:13px; }
@@ -393,9 +477,20 @@ _PAGE = r'''<!DOCTYPE html>
       <span id="uploadStatus"></span>
     </div>
     <div id="fileList"></div>
+
+    <div class="std-panel">
+      <div class="std-title">📋 标准文件管理 <small>（上传后并入请求前缀，命中 DeepSeek 前缀缓存）</small></div>
+      <div id="stdList"></div>
+    </div>
   </div>
 
   <div class="messages" id="messages"></div>
+  <div class="suggest" id="suggest">
+    <span class="suggest-label">hi，猜你想问：</span>
+    <button class="chip" data-task="revise_proposal" data-q="帮我修改策划案">帮我修改策划案</button>
+    <button class="chip" data-task="revise_art" data-q="帮我修改美术需求">帮我修改美术需求</button>
+    <button class="chip" data-task="organize_ui" data-q="帮我整理UI需求">帮我整理UI需求</button>
+  </div>
   <div class="inputbar">
     <textarea id="input" rows="1" placeholder="输入你的问题，Enter 发送，Shift+Enter 换行"></textarea>
     <button id="send">发送</button>
@@ -406,6 +501,7 @@ _PAGE = r'''<!DOCTYPE html>
   var messagesEl = document.getElementById('messages');
   var inputEl = document.getElementById('input');
   var sendBtn = document.getElementById('send');
+  var currentTask = null;  // 当前选中的「猜你想问」任务键，随本次发送带上，服务端按会话记忆
 
   function scrollToBottom() { messagesEl.scrollTop = messagesEl.scrollHeight; }
 
@@ -432,13 +528,23 @@ _PAGE = r'''<!DOCTYPE html>
       if (typeof s === 'string') return escapeHtml(s);
       if (Array.isArray(s)) return escapeHtml(s.join(' — '));
       if (typeof s === 'object') {
+        var ref = (s.ref_id !== undefined) ? '[' + s.ref_id + '] ' : '';
         var name = s.source || s.doc || s.name || '';
-        var score = (s.relevance_score !== undefined) ? '（相关度 ' + s.relevance_score + '）' : '';
-        return escapeHtml(String(name) + score);
+        var ex = s.excerpt ? '：' + s.excerpt : '';
+        return escapeHtml(ref + name + ex);
       }
       return escapeHtml(String(s));
     });
     return '<div class="sources">📚 <b>来源：</b>' + items.join('；') + '</div>';
+  }
+
+  function formatConfidence(confidence, low) {
+    if (low) return '<div class="confidence low">⚠️ 置信度低：检索资料不足，回答可能不可靠</div>';
+    if (confidence === undefined || confidence === null) return '';
+    var pct = Math.round(confidence * 100);
+    var cls = confidence >= 0.7 ? 'high' : (confidence >= 0.4 ? 'mid' : 'low');
+    var label = cls === 'high' ? '高' : (cls === 'mid' ? '中' : '低');
+    return '<div class="confidence ' + cls + '">🎯 置信度：' + pct + '%（' + label + '）</div>';
   }
 
   function formatFacts(facts) {
@@ -470,22 +576,42 @@ _PAGE = r'''<!DOCTYPE html>
 
   function send() {
     var q = inputEl.value.trim();
+    // 修复：先取任务键再判空。原写法在输入为空时直接 return，
+    // currentTask 却已被芯片设置好且没清掉，会「残留」到用户下一次手动提问上，
+    // 导致普通问题莫名走成任务模式。
+    var task = currentTask;      // 捕获本次任务键（芯片点击设置的）
+    currentTask = null;          // 用后即清，避免污染后续手动输入
     if (!q) return;
     lastUserQuestion = q;
     inputEl.value = '';
     addMessage('user', escapeHtml(q));
+    sendBtn.disabled = true;
 
+    // 加载气泡（在拿到首个 token 前显示）
     var loading = document.createElement('div');
     loading.className = 'msg bot';
     loading.innerHTML = '<div class="bubble"><div class="loading"><span></span><span></span><span></span></div></div>';
     messagesEl.appendChild(loading);
     scrollToBottom();
-    sendBtn.disabled = true;
 
-    // 把评分按钮挂到“真正显示出来的那条回答气泡”上（而非已移除的加载气泡）
+    var bubble = null;
+    var tokenBuf = '';
+
+    // 首个 token 到达时把加载气泡换成真正的回答气泡
+    function ensureBubble() {
+      if (bubble) return bubble;
+      loading.remove();
+      var wrap = document.createElement('div');
+      wrap.className = 'msg bot';
+      bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      wrap.appendChild(bubble);
+      messagesEl.appendChild(wrap);
+      scrollToBottom();
+      return bubble;
+    }
+
     function attachFeedback(answerText) {
-      var bubbles = messagesEl.querySelectorAll('.msg.bot .bubble');
-      var bubble = bubbles[bubbles.length - 1];
       if (!bubble || bubble.querySelector('.feedback')) return;
       var fb = document.createElement('div');
       fb.className = 'feedback';
@@ -495,26 +621,61 @@ _PAGE = r'''<!DOCTYPE html>
       bubble.appendChild(fb);
     }
 
-    fetch('/ask', {
+    fetch('/ask_stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: q, session_id: sessionId })
+      body: JSON.stringify({ question: q, session_id: sessionId, task: task })
     })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      loading.remove();
-      sendBtn.disabled = false;
-      if (d.error) {
-        addMessage('bot', '<span class="err">⚠️ ' + escapeHtml(d.error) + '</span>');
-        return;
+    .then(function(res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      var reader = res.body.getReader();
+      var decoder = new TextDecoder('utf-8');
+      var buf = '';
+
+      function pump() {
+        return reader.read().then(function(result) {
+          if (result.done) { sendBtn.disabled = false; return; }
+          buf += decoder.decode(result.value, { stream: true });
+          // SSE 以空行（\n\n）分隔事件，把已完整的事件切出来处理，残留片段留到下次
+          var parts = buf.split('\n\n');
+          buf = parts.pop();
+          for (var i = 0; i < parts.length; i++) {
+            var line = parts[i].trim();
+            if (line.indexOf('data: ') !== 0) continue;
+            var msg;
+            try { msg = JSON.parse(line.slice(6)); } catch (e) { continue; }
+            if (msg.type === 'token') {
+              var b = ensureBubble();
+              tokenBuf += msg.text;
+              b.innerHTML = escapeHtml(tokenBuf).replace(/\n/g, '<br>');
+              scrollToBottom();
+            } else if (msg.type === 'meta') {
+              var b2 = ensureBubble();
+              var d = msg.data;
+              if (!tokenBuf) {
+                // 没有流式正文（如拒答场景）：用 meta.answer 兜底显示
+                b2.innerHTML = escapeHtml(d.answer || '').replace(/\n/g, '<br>');
+              }
+              if (d.is_followup) {
+                b2.innerHTML = '<span class="followup">↺ 多轮追问</span>' + b2.innerHTML;
+              }
+              b2.innerHTML += formatConfidence(d.confidence, d.low_confidence);
+              b2.innerHTML += formatSources(d.sources);
+              b2.innerHTML += formatFacts(d.key_facts);
+              b2.innerHTML += formatToken(d.token_report);
+              attachFeedback(d.answer || tokenBuf);
+            } else if (msg.type === 'error') {
+              var b3 = ensureBubble();
+              b3.innerHTML += '<span class="err">⚠️ ' + escapeHtml(msg.message) + '</span>';
+              sendBtn.disabled = false;
+            } else if (msg.type === 'done') {
+              sendBtn.disabled = false;
+            }
+          }
+          return pump();
+        });
       }
-      var tag = d.is_followup ? '<span class="followup">↺ 多轮追问</span>' : '';
-      var html = tag + escapeHtml(d.answer).replace(/\n/g, '<br>');
-      html += formatSources(d.sources);
-      html += formatFacts(d.key_facts);
-      html += formatToken(d.token_report);
-      addMessage('bot', html);
-      attachFeedback(d.answer);
+      return pump();
     })
     .catch(function(e) {
       loading.remove();
@@ -536,12 +697,27 @@ _PAGE = r'''<!DOCTYPE html>
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   });
 
+  // ===== 猜你想问：快捷指令芯片，点击即按对应任务发送 =====
+  document.querySelectorAll('#suggest .chip').forEach(function(chip) {
+    chip.addEventListener('click', function() {
+      currentTask = chip.getAttribute('data-task');   // 任务键：服务端据此注入固定系统指令
+      inputEl.value = chip.getAttribute('data-q') || '';
+      send();
+    });
+  });
+
   document.getElementById('newchat').onclick = function() {
+    // 修复：/clear 原先返回 500 时 fetch 不会 reject，.finally 照样执行，
+    // 前端表现成「新对话成功」而服务端记忆从未清除 —— 静默失败。
+    // 这里显式检查响应状态并告警，界面重置则无论成败都照常进行。
     fetch('/clear', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: sessionId })
-    }).finally(function() {
+    })
+    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); })
+    .catch(function(e) { console.warn('[clear] 服务端清空会话失败：', e); })
+    .then(function() {
       messagesEl.innerHTML = '';
       sessionId = 'sess-' + Math.random().toString(36).slice(2);
       addMessage('bot', '👋 已开启新对话，基于你的文档，有什么想问的？');
@@ -556,6 +732,7 @@ _PAGE = r'''<!DOCTYPE html>
     if (filePanel.style.display === 'none' || !filePanel.style.display) {
       filePanel.style.display = 'block';
       loadFileList();
+      loadStdList();
     } else {
       filePanel.style.display = 'none';
     }
@@ -573,9 +750,20 @@ _PAGE = r'''<!DOCTYPE html>
           fileListEl.innerHTML = '<div style="color:#999;">暂无文档，上传一个 PDF 或 TXT 试试吧</div>';
           return;
         }
+        // 安全修复：原先把文件名直接拼进 onclick="deleteFile('...')"，
+        // 文件名里含单引号/引号时会截断 JS 字符串，既可造成按钮失效，也可被注入脚本。
+        // 改为写进 data-* 属性（经 escapeHtml 转义）再用事件绑定读取。
         fileListEl.innerHTML = docs.map(function(d) {
-          return '<div class="file-item"><span>📄 ' + escapeHtml(d.filename) + ' <small style="color:#999;">(' + d.size_kb + ' KB, ' + d.upload_time + ')</small></span><button onclick="deleteFile(\'' + d.filename + '\')">🗑 删除</button></div>';
+          return '<div class="file-item">' +
+            '<span>📄 ' + escapeHtml(d.filename) +
+            ' <small style="color:#999;">(' + escapeHtml(String(d.size_kb)) + ' KB, ' +
+            escapeHtml(String(d.upload_time)) + ')</small></span>' +
+            '<button class="del-doc" data-file="' + escapeHtml(d.filename) + '">🗑 删除</button>' +
+            '</div>';
         }).join('');
+        fileListEl.querySelectorAll('.del-doc').forEach(function(btn) {
+          btn.onclick = function() { deleteFile(btn.getAttribute('data-file')); };
+        });
       })
       .catch(function(e) {
         fileListEl.innerHTML = '<div style="color:#e54d42;">加载失败</div>';
@@ -631,6 +819,67 @@ _PAGE = r'''<!DOCTYPE html>
       }
     });
   };
+
+  // ===== 标准文件管理：在文件管理面板内上传/删除各任务的标准文档 =====
+  var STD_TASKS = [
+    { key: "revise_proposal", label: "标准策划案" },
+    { key: "revise_art", label: "标准美术需求" },
+    { key: "organize_ui", label: "标准UI需求" }
+  ];
+  var stdListEl = document.getElementById('stdList');
+
+  function loadStdList() {
+    fetch('/admin/standard_list')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.error) { stdListEl.innerHTML = '<div style="color:#e54d42;">加载失败：' + data.error + '</div>'; return; }
+        stdListEl.innerHTML = STD_TASKS.map(function(t) {
+          var info = data[t.key] || {};
+          var meta = info.has_doc
+            ? '<div class="std-meta">已载入：' + info.length + ' 字' + (info.preview ? ' · 预览：' + info.preview + '…' : '') + '</div>'
+            : '<div class="std-meta">尚未上传标准文档</div>';
+          return '<div class="std-item">' +
+            '<span class="std-label">' + t.label + '</span>' +
+            '<input type="file" id="stdFile_' + t.key + '" accept=".pdf,.txt,.md">' +
+            '<button class="std-btn" data-key="' + t.key + '">上传</button>' +
+            (info.has_doc ? '<button class="std-del" data-key="' + t.key + '">清空</button>' : '') +
+            '<span class="std-status" id="stdStatus_' + t.key + '"></span>' +
+            meta +
+            '</div>';
+        }).join('');
+
+        stdListEl.querySelectorAll('.std-btn').forEach(function(btn) {
+          btn.onclick = function() {
+            var key = btn.getAttribute('data-key');
+            var input = document.getElementById('stdFile_' + key);
+            var status = document.getElementById('stdStatus_' + key);
+            if (!input.files.length) { status.textContent = '请先选文件'; status.style.color = '#e54d42'; return; }
+            var fd = new FormData();
+            fd.append('file', input.files[0]);
+            fd.append('task', key);
+            status.textContent = '解析中…'; status.style.color = '#6a5cff';
+            fetch('/admin/standard_upload', { method: 'POST', body: fd })
+              .then(function(r) { return r.json(); })
+              .then(function(d) {
+                if (d.error) { status.textContent = '❌ ' + d.error; status.style.color = '#e54d42'; }
+                else { status.textContent = '✅ 已载入 ' + d.length + ' 字'; status.style.color = '#4f7cff'; loadStdList(); }
+              })
+              .catch(function() { status.textContent = '❌ 上传失败'; status.style.color = '#e54d42'; });
+          };
+        });
+        stdListEl.querySelectorAll('.std-del').forEach(function(btn) {
+          btn.onclick = function() {
+            var key = btn.getAttribute('data-key');
+            if (!confirm('清空该标准文档？')) return;
+            fetch('/admin/standard_delete', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ task: key })
+            }).then(function() { loadStdList(); });
+          };
+        });
+      })
+      .catch(function() { stdListEl.innerHTML = '<div style="color:#e54d42;">加载失败</div>'; });
+  }
 
   // ===== 账号分层：管理员登录态 =====
   var isAdmin = false;
@@ -699,12 +948,15 @@ def ask():
         data = request.get_json(force=True)
         question = data.get("question", "").strip()
         session_id = data.get("session_id", "default")
+        # 修复：非流式 /ask 此前完全忽略 task，与 /ask_stream 行为分裂
+        # （流式带任务走快路径，非流式却仍去检索）。这里对齐两者语义。
+        task = _remember_task(session_id, data.get("task"))
 
         if not question:
             return jsonify({"error": "请输入问题"}), 400
 
         t0 = _time.time()
-        result = get_rag().ask(question, session_id=session_id)
+        result = get_rag().ask(question, session_id=session_id, task=task)
         elapsed = _time.time() - t0
         print(f"[Web] 问题: {question[:30]} | 总耗时: {elapsed:.1f}s")
 
@@ -716,6 +968,9 @@ def ask():
             "sources": result.get("sources", []),
             "key_facts": result.get("key_facts", []),
             "token_report": result.get("token_report"),
+            "confidence": result.get("confidence"),
+            "low_confidence": result.get("low_confidence", False),
+            "reject_reason": result.get("reject_reason"),
             "is_followup": result.get("is_followup")
         })
 
@@ -723,6 +978,44 @@ def ask():
         safe_msg = str(e)
         print(f"[Web] /ask 异常: {safe_msg}")
         return jsonify({"error": f"服务暂时不可用，请稍后重试。（{safe_msg}）"}), 500
+
+@app.route("/ask_stream", methods=["POST"])
+def ask_stream():
+    """流式问答端点：返回 text/event-stream（SSE），把答案逐字推给前端。"""
+    try:
+        data = request.get_json(force=True)
+        question = data.get("question", "").strip()
+        session_id = data.get("session_id", "default")
+        # 任务键：优先取本次请求携带的；否则沿用本会话之前选过的（让任务指令贯穿整轮对话）
+        task = _remember_task(session_id, data.get("task"))
+        if not question:
+            return jsonify({"error": "请输入问题"}), 400
+
+        def event_stream():
+            try:
+                for kind, payload in get_rag().multi_agent_ask_stream(question, session_id=session_id, task=task):
+                    if kind == "token":
+                        yield "data: " + _json.dumps({"type": "token", "text": payload}, ensure_ascii=False) + "\n\n"
+                    elif kind == "meta":
+                        yield "data: " + _json.dumps({"type": "meta", "data": payload}, ensure_ascii=False) + "\n\n"
+                    elif kind == "error":
+                        yield "data: " + _json.dumps({"type": "error", "message": payload}, ensure_ascii=False) + "\n\n"
+                yield "data: " + _json.dumps({"type": "done"}, ensure_ascii=False) + "\n\n"
+            except Exception as e:
+                yield "data: " + _json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False) + "\n\n"
+
+        # SSE 必须关闭缓冲，否则浏览器要等攒够才显示
+        return Response(
+            event_stream(),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",   # 关掉反向代理缓冲（如 cpolar / nginx）
+                "Connection": "keep-alive",
+            },
+        )
+    except Exception as e:
+        return jsonify({"error": f"服务暂时不可用，请稍后重试。（{e}）"}), 500
 
 @app.route("/delete", methods=["POST"])
 def delete():
@@ -795,7 +1088,8 @@ def feedback():
 @app.route("/admin_login", methods=["POST"])
 def admin_login():
     if not _ADMIN_PASSWORDS:
-        return jsonify({"error": "服务端未配置管理员口令"}), 500
+        # 服务端未配置口令属于「配置缺失」，登录动作本身无权通过 → 403 而非 500
+        return jsonify({"error": "服务端未配置管理员口令，请联系部署者在 .env 设置 KNOWFLOW_ADMIN_PASSWORD"}), 403
     ip = request.remote_addr
     locked_until = _login_locked_until(ip)
     if locked_until:
@@ -830,9 +1124,166 @@ def clear():
         data = request.get_json(force=True, silent=True) or {}
         session_id = data.get("session_id", "default")
         get_rag().clear_session(session_id)
+        SESSION_TASKS.pop(session_id, None)  # 清对话同时清掉任务记忆
         return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ===== 管理员：任务提示词 / 标准文档 在线编辑（复用 RBAC：_is_admin）=====
+_ADMIN_TASKS = [
+    ("revise_proposal", "修改策划案"),
+    ("revise_art", "修改美术需求"),
+    ("organize_ui", "整理 UI 需求"),
+]
+
+@app.route("/admin/prompts", methods=["GET"])
+def admin_prompts_page():
+    """提示词与标准文档编辑页（/admin/prompts）：编辑后并入请求前缀并命中 DeepSeek 缓存。"""
+    if not _is_admin():
+        return ("请先以管理员身份登录：POST /admin_login（口令来自 .env 的 "
+                "KNOWFLOW_ADMIN_PASSWORD），再访问本页。"), 403
+    sections = []
+    for key, label in _ADMIN_TASKS:
+        p = get_task_prompt(key) or ""
+        d = get_standard_doc(key)
+        sections.append(
+            '<div class="task-card">'
+            f'<h3>{label} <code>{key}</code></h3>'
+            '<label>任务提示词（固定前缀，会被缓存）</label>'
+            f'<textarea id="prompt_{key}" rows="6">{html.escape(p)}</textarea>'
+            '<label>标准文档（并入前缀，会被缓存）</label>'
+            f'<textarea id="doc_{key}" rows="10">{html.escape(d)}</textarea>'
+            '</div>'
+        )
+    sections_html = "\n".join(sections)
+    tasks_json = _json.dumps([k for k, _ in _ADMIN_TASKS])
+    page = f'''<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<title>KnowFlow 管理页</title>
+<style>
+  body{{font-family:-apple-system,Segoe UI,Microsoft YaHei,sans-serif;margin:0;background:#f5f6fa;color:#222}}
+  .wrap{{max-width:880px;margin:0 auto;padding:24px}}
+  h1{{font-size:20px}} .task-card{{background:#fff;border:1px solid #e3e6ee;border-radius:10px;padding:16px;margin-bottom:16px}}
+  label{{display:block;font-size:13px;color:#555;margin:10px 0 4px}}
+  textarea{{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccd2e0;border-radius:6px;font-size:13px;line-height:1.5}}
+  button{{margin-top:8px;background:#4f7cff;color:#fff;border:0;padding:10px 18px;border-radius:8px;cursor:pointer;font-size:14px}}
+  .status{{margin-left:12px;font-size:13px;color:#2a8a4a}}
+</style></head><body><div class="wrap">
+  <h1>KnowFlow 管理页 · 任务提示词与标准文档</h1>
+  <p style="font-size:13px;color:#666">改完点保存即可生效；这些内容会以「固定前缀」形式进入每次请求并命中 DeepSeek 前缀缓存。</p>
+  {sections_html}
+  <button onclick="saveAll()">保存全部</button><span class="status" id="status"></span>
+  <script>
+  async function saveAll(){{
+    const tasks={tasks_json};
+    const payload={{tasks:{{}}}};
+    tasks.forEach(t=>{{
+      payload.tasks[t]={{prompt:document.getElementById('prompt_'+t).value, standard_doc:document.getElementById('doc_'+t).value}};
+    }});
+    const r=await fetch('/admin/prompts/update',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}});
+    const j=await r.json();
+    document.getElementById('status').textContent = j.status==='ok'?'已保存 ✓':'保存失败：'+(j.error||'');
+  }}
+  </script>
+</div></body></html>'''
+    return page
+
+
+@app.route("/admin/prompts/update", methods=["POST"])
+def admin_prompts_update():
+    """保存管理员编辑的任务提示词 / 标准文档，写回 config/*.json 并热更新。"""
+    if not _is_admin():
+        return jsonify({"error": "unauthorized"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    tasks = data.get("tasks", {})
+    if not isinstance(tasks, dict):
+        return jsonify({"error": "bad payload"}), 400
+    new_prompts, new_docs = {}, {}
+    for k, v in tasks.items():
+        if not isinstance(v, dict):
+            continue
+        if "prompt" in v:
+            new_prompts[k] = v["prompt"]
+        if "standard_doc" in v:
+            new_docs[k] = v["standard_doc"]
+    # 用取值函数取当前值再合并，避免把上一次保存的内容覆盖掉
+    if new_prompts:
+        save_prompts({**get_task_prompts(), **new_prompts})
+    if new_docs:
+        save_standard_docs({**get_standard_docs(), **new_docs})
+    return jsonify({"status": "ok"})
+
+
+# ===== 标准文件管理：在文件管理面板内上传/删除各任务的标准文档 =====
+# 复用同一套 DocumentProcessor 做文本抽取（PDF/TXT/MD），抽出全文存入标准文档配置。
+_std_proc = DocumentProcessor()
+
+def _extract_full_text(file_obj):
+    """把上传文件落临时盘 → 用 DocumentProcessor 抽全文 → 删除临时盘，返回纯文本。"""
+    import tempfile
+    suffix = os.path.splitext(file_obj.filename)[1].lower()
+    tmp = os.path.join(tempfile.gettempdir(), f"_std_{os.getpid()}_{_time.time()}{suffix}")
+    file_obj.save(tmp)
+    try:
+        chunks = _std_proc.process_file(tmp)
+        return "\n".join(c.get("content", "") for c in chunks)
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+@app.route("/admin/standard_list", methods=["GET"])
+def admin_standard_list():
+    """返回各任务当前已载入的标准文档概况（供文件管理面板渲染）。"""
+    if not _is_admin():
+        return jsonify({"error": "unauthorized"}), 403
+    out = {}
+    for key, _ in _ADMIN_TASKS:
+        d = get_standard_doc(key)
+        out[key] = {"has_doc": bool(d), "length": len(d), "preview": d[:120]}
+    return jsonify(out)
+
+@app.route("/admin/standard_upload", methods=["POST"])
+def admin_standard_upload():
+    """上传某任务的标准文档文件（PDF/TXT/MD），抽取全文并入前缀缓存配置。"""
+    if not _is_admin():
+        return jsonify({"error": "unauthorized"}), 403
+    task = (request.form.get("task") or "").strip()
+    if task not in dict(_ADMIN_TASKS):
+        return jsonify({"error": "bad task"}), 400
+    if "file" not in request.files:
+        return jsonify({"error": "没有文件"}), 400
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "未选择文件"}), 400
+    allowed = (".pdf", ".txt", ".md")
+    if not file.filename.lower().endswith(allowed):
+        return jsonify({"error": "仅支持 PDF / TXT / MD"}), 400
+    try:
+        text = _extract_full_text(file)
+        if not text.strip():
+            return jsonify({"error": "文件无可用文本（可能是扫描件/空文件）"}), 400
+        save_standard_docs({**get_standard_docs(), task: text})
+        return jsonify({"status": "ok", "length": len(text), "filename": file.filename})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/admin/standard_delete", methods=["POST"])
+def admin_standard_delete():
+    """清空某任务的标准文档。"""
+    if not _is_admin():
+        return jsonify({"error": "unauthorized"}), 403
+    data = request.get_json(force=True, silent=True) or {}
+    task = (data.get("task") or "").strip()
+    if task not in dict(_ADMIN_TASKS):
+        return jsonify({"error": "bad task"}), 400
+    cur = get_standard_docs()
+    cur.pop(task, None)
+    save_standard_docs(cur)
+    return jsonify({"status": "ok"})
+
+
 
 # ===== 启动 =====
 if __name__ == '__main__':

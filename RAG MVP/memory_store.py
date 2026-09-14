@@ -34,7 +34,16 @@ class RAGMemoryStore:
         把一轮对话存进去（自动算向量）
         """
         text = f"Q: {question}\nA: {answer}"
-        embedding = self.embedder.encode(text).tolist()
+        # embedder 缺失时不再抛 AttributeError 把整轮问答带崩：
+        # 退化成「无向量」条目，后续 retrieve 会跳过它，对话流程不受影响。
+        if self.embedder is None:
+            embedding = None
+        else:
+            try:
+                embedding = self.embedder.encode(text).tolist()
+            except Exception as e:
+                print(f"[memory] 向量化失败，按无向量条目存储: {e}")
+                embedding = None
 
         self.entries.append({
             "text": text,
@@ -60,12 +69,21 @@ class RAGMemoryStore:
         if not self.entries:
             return []
 
+        if self.embedder is None:
+            return []
+
         query_emb = self.embedder.encode(query)
 
         # 余弦相似度
         results = []
         for entry in self.entries:
-            entry_emb = np.array(entry["embedding"])
+            # 兼容性修复：早期版本落盘的条目可能没有 embedding 字段
+            # （或 embedder 缺失时存成了 None），直接取键会抛 KeyError，
+            # 一旦有一条脏数据，整个会话的历史检索就全废了 —— 这里跳过即可。
+            emb = entry.get("embedding")
+            if emb is None:
+                continue
+            entry_emb = np.array(emb)
             score = self._cosine(query_emb, entry_emb)
             results.append({
                 "text": entry["text"],

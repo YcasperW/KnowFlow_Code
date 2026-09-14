@@ -4,3 +4,4 @@ numpy
 openai
 sentence-transformers
 scikit-learn
+pydantic>=2.0

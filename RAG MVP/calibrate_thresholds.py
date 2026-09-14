@@ -16,7 +16,10 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from clustered_retriever import ClusteredRetriever
 
-BASE = "D:/杂/个人文件/Openworkspace/RAG MVP/output"
+# 修复：原为硬编码绝对路径，换台机器/换个目录就 FileNotFoundError。
+# 改为相对本文件定位项目根（与 Web Frame.py 的路径规则一致）。
+BASE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
 CHUNKS = os.path.join(BASE, "chunks.json")
 EMB = os.path.join(BASE, "embeddings.npy")
 IDX = os.path.join(BASE, "cluster_index")

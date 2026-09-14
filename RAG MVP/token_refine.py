@@ -339,7 +339,11 @@ class HandoffCompressor:
             compressed_prompt = self._build_compressed_prompt(compressed_data, query)
             original_tokens = self._estimate_tokens(combined_text)
             compressed_tokens = self._estimate_tokens(compressed_prompt)
-            savings = (1 - compressed_tokens / original_tokens) * 100
+            # 修复：原文为空文本时 original_tokens=0，这里会抛 ZeroDivisionError，
+            # 异常被外层 except 吞掉后白白浪费一次 LLM 调用并降级。
+            # 同时把节省率下限截到 0：提示语本身有固定开销，
+            # 片段极短时算出负值会让前端显示「节省 -30%」。
+            savings = max(0.0, (1 - compressed_tokens / original_tokens) * 100) if original_tokens > 0 else 0.0
 
             print(f"🗜️ Handoff 压缩: "
                   f"{original_tokens} → {compressed_tokens} tokens "
@@ -413,7 +417,8 @@ class HandoffCompressor:
             "source_refs": refs, "artifact_paths": artifact_paths,
             "compressed_prompt": cp,
             "stats": {"original_tokens": ot, "compressed_tokens": ct,
-                      "savings_percent": round((1 - ct / ot) * 100, 1) if ot > 0 else 0,
+                      # 同上：防除零 + 不为负
+                      "savings_percent": round(max(0.0, (1 - ct / ot) * 100), 1) if ot > 0 else 0,
                       "fact_count": len(facts)}
         }
         if self.cache:
@@ -460,18 +465,30 @@ class KnowFlowTokenOptimizer:
                  enable_artifact=True,
                  enable_cache=True,
                  cache_dir="output/cache",
+                 artifact_dir="output/artifacts",
                  simple_top_k=2,
                  complex_top_k=8):
 
         self.client = client
         self.model = model
+        # 修复：这两个目录原是相对路径，工作目录一变（例如从别处启动服务）
+        # 缓存和产物就会散落到当前目录，导致缓存永不命中、artifact 找不到。
+        # 统一按项目根目录解析成绝对路径。
+        _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if not os.path.isabs(cache_dir):
+            cache_dir = os.path.join(_BASE, cache_dir)
+        if not os.path.isabs(artifact_dir):
+            artifact_dir = os.path.join(_BASE, artifact_dir)
         self.cache = TokenOptimizerCache(cache_dir) if enable_cache else None
 
         self.layer1_filter = SmartContextFilter(client, model, cache=self.cache)
+        # 修复：ArtifactLoader 与 HandoffCompressor 原先各自用默认目录，
+        # 一旦传入自定义 artifact_dir，压缩写进去的路径加载器就找不到，
+        # 按需加载会静默失效。这里统一用同一个目录。
         self.layer2_compressor = HandoffCompressor(
-            client, model, cache=self.cache
+            client, model, artifact_dir=artifact_dir, cache=self.cache
         )
-        self.layer3_loader = ArtifactLoader()
+        self.layer3_loader = ArtifactLoader(artifact_dir)
         self.router = QueryRouter(
             simple_top_k=simple_top_k,
             complex_top_k=complex_top_k
@@ -518,7 +535,9 @@ class KnowFlowTokenOptimizer:
         final_tokens = self._estimate_tokens(
             compression_result["compressed_prompt"]
         )
-        total_savings = (1 - final_tokens / original_tokens) * 100 if original_tokens > 0 else 0
+        # 下限截到 0：把「问题」「请基于以上资料回答」等提示开销也算进 final 后，
+        # 短片段场景可能算出负值，前端会显示成「节省 -X%」。
+        total_savings = max(0.0, (1 - final_tokens / original_tokens) * 100) if original_tokens > 0 else 0
 
         report = {
             "original_tokens": original_tokens,
@@ -563,7 +582,7 @@ class KnowFlowTokenOptimizer:
             "after_smart_context": final_tokens,
             "after_compression": final_tokens,
             "total_savings_percent": round(
-                (1 - final_tokens / original_tokens) * 100, 1
+                max(0.0, (1 - final_tokens / original_tokens) * 100), 1
             ) if original_tokens > 0 else 0,
             "layer1_filtered": len(chunks) - len(kept),
             "layer2_compression_rate": 0,
